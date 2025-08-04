@@ -53,6 +53,13 @@ data/faces/*.png
 data/encodings/*
 *.log
 
+# Prevent duplicate page files (keep only underscore-prefixed versions)
+pages/camera_registration.py
+pages/live_attendance.py  
+pages/live_attendance_webrtc.py
+pages/register.py
+pages/reports.py
+
 # Temporary files
 *.tmp
 *.bak

@@ -3,6 +3,8 @@ from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfigura
 import av
 import cv2
 import numpy as np
+import time
+from datetime import datetime, date
 from database.db_manager import DatabaseManager
 from face_detection.face_detector import FaceDetector
 from face_detection.anti_spoofing import LivenessDetector
@@ -22,9 +24,18 @@ class FaceRecognitionTransformer(VideoTransformerBase):
         face_data = self.db_manager.get_user_face_encodings()
         self.face_detector.load_known_faces(face_data)
         
-        self.confidence_threshold = 0.6
+        self.confidence_threshold = 0.5
         self.enable_liveness = True
         self.attendance_mode = 'check_in'  # Will be updated from session state
+        
+        # Performance optimization
+        self.frame_skip_count = 0
+        self.skip_frames = 3  # Process every 3rd frame for better performance
+        self.last_processed_result = []
+        
+        # Unknown person tracking
+        self.unknown_persons = {}
+        self.unknown_counter = 0
         
     def set_attendance_mode(self, mode):
         """Set the attendance tracking mode"""
@@ -58,77 +69,191 @@ class FaceRecognitionTransformer(VideoTransformerBase):
                 return "pending"  # No check-in yet
         else:
             return "no_record"  # No attendance record for today
+    
+    def _handle_unknown_person(self, location):
+        """Handle unknown person detection"""
+        # Generate unique ID for unknown person based on location
+        location_key = f"{location[0]}_{location[1]}_{location[2]}_{location[3]}"
+        
+        if location_key not in self.unknown_persons:
+            self.unknown_counter += 1
+            unknown_id = f"Unknown_{self.unknown_counter}"
+            self.unknown_persons[location_key] = {
+                'id': unknown_id,
+                'first_seen': time.time(),
+                'last_seen': time.time()
+            }
+        else:
+            self.unknown_persons[location_key]['last_seen'] = time.time()
+        
+        return self.unknown_persons[location_key]['id']
         
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         
-        # Process frame for face recognition
-        detected_faces = self.face_detector.detect_faces_in_frame(img, scale_factor=0.5)
+        # Frame skipping for performance
+        self.frame_skip_count += 1
+        if self.frame_skip_count < self.skip_frames:
+            # Use last processed result for intermediate frames
+            return self._draw_cached_results(img)
+        
+        self.frame_skip_count = 0
+        
+        # Process frame for face recognition with optimization
+        detected_faces = self.face_detector.detect_faces_optimized(img, skip_frames=self.skip_frames)
         
         # Process liveness detection if enabled
-        if self.enable_liveness and detected_faces:
+        if self.enable_liveness and detected_faces and detected_faces[0][0] != "No face detected":
             is_live, detection_complete, status_message, processed_frame = self.liveness_detector.process_frame(img)
         else:
             processed_frame = img.copy()
             is_live = True
             detection_complete = True
-            status_message = "Liveness detection disabled"
+            status_message = "Ready for recognition"
         
-        # Draw face boxes and information
-        if detected_faces:
-            processed_frame = self.face_detector.draw_face_boxes(processed_frame, detected_faces)
+        # Process detected faces
+        recognition_results = []
+        for name, location, confidence in detected_faces:
+            if name == "No face detected":
+                continue
+                
+            # Handle unknown persons
+            if name == "Unknown Person":
+                unknown_id = self._handle_unknown_person(location)
+                display_name = unknown_id
+                color = (0, 0, 255)  # Red for unknown
+                user_id = None
+            else:
+                display_name = name
+                color = (0, 255, 0)  # Green for known
+                # Get user_id from database
+                user_id = self._get_user_id_by_name(name)
             
-            # Add status text
-            cv2.putText(processed_frame, status_message, (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            
-            # Process recognitions for attendance
-            for name, confidence, location, user_id in detected_faces:
-                if confidence >= self.confidence_threshold and is_live and detection_complete:
-                    
-                    # Determine action based on mode
-                    action = self._determine_action()
-                    
-                    # Get current attendance status
-                    status = self._get_attendance_status(user_id)
-                    
-                    # Determine if attendance should be marked
-                    should_mark = False
-                    message = ""
-                    
-                    if action == 'check_in':
-                        if status in ['no_record', 'pending']:
-                            should_mark = True
-                            message = f"✅ CHECK-IN: {name}"
-                        else:
-                            message = f"ℹ️ Already checked in: {name}"
-                    elif action == 'check_out':
-                        if status == 'checked_in':
-                            should_mark = True
-                            message = f"🚪 CHECK-OUT: {name}"
-                        elif status == 'completed':
-                            message = f"ℹ️ Already checked out: {name}"
-                        else:
-                            message = f"⚠️ Must check in first: {name}"
-                    
-                    # Mark attendance if appropriate
-                    if should_mark:
-                        success = self.db_manager.mark_attendance(user_id, confidence, action)
-                        if success:
-                            cv2.putText(processed_frame, message, (10, 60),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                        else:
-                            cv2.putText(processed_frame, f"❌ Error marking attendance: {name}", (10, 60),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    else:
-                        cv2.putText(processed_frame, message, (10, 60),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                    
-                    # Show attendance mode
-                    cv2.putText(processed_frame, f"Mode: {action.upper()}", (10, 90),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            recognition_results.append({
+                'name': display_name,
+                'location': location,
+                'confidence': confidence,
+                'color': color,
+                'user_id': user_id,
+                'is_known': name != "Unknown Person"
+            })
+        
+        # Cache results for frame skipping
+        self.last_processed_result = recognition_results
+        
+        # Draw results on frame
+        processed_frame = self._draw_recognition_results(processed_frame, recognition_results, 
+                                                       is_live, detection_complete, status_message)
         
         return av.VideoFrame.from_ndarray(processed_frame, format="bgr24")
+    
+    def _get_user_id_by_name(self, name):
+        """Get user ID by name from database"""
+        try:
+            conn = self.db_manager.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM users WHERE name = ? AND is_active = 1", (name,))
+            result = cursor.fetchone()
+            conn.close()
+            return result[0] if result else None
+        except:
+            return None
+    
+    def _draw_cached_results(self, frame):
+        """Draw cached recognition results for skipped frames"""
+        if not self.last_processed_result:
+            return av.VideoFrame.from_ndarray(frame, format="bgr24")
+        
+        processed_frame = self._draw_recognition_results(frame, self.last_processed_result, 
+                                                       True, True, "Using cached results...")
+        return av.VideoFrame.from_ndarray(processed_frame, format="bgr24")
+    
+    def _draw_recognition_results(self, frame, results, is_live, detection_complete, status_message):
+        """Draw recognition results on frame"""
+        # Add status text
+        status_color = (0, 255, 0) if is_live and detection_complete else (0, 255, 255)
+        cv2.putText(frame, status_message, (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+        
+        # Draw face boxes and labels
+        for result in results:
+            name = result['name']
+            location = result['location']
+            confidence = result['confidence']
+            color = result['color']
+            
+            if location:
+                top, right, bottom, left = location
+                
+                # Draw rectangle
+                cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+                
+                # Draw label background
+                label = f"{name}"
+                if confidence > 0:
+                    label += f" ({confidence:.2f})"
+                
+                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                cv2.rectangle(frame, (left, bottom - 35), (left + label_size[0], bottom), color, cv2.FILLED)
+                
+                # Draw label text
+                text_color = (255, 255, 255) if result['is_known'] else (255, 255, 255)
+                cv2.putText(frame, label, (left + 6, bottom - 6),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+                
+                # Handle attendance marking for known persons
+                if result['is_known'] and result['user_id'] and confidence >= self.confidence_threshold:
+                    if is_live and detection_complete:
+                        self._process_attendance(result['user_id'], name, confidence)
+        
+        # Show unknown persons count
+        if len(self.unknown_persons) > 0:
+            unknown_text = f"Unknown persons detected: {len(self.unknown_persons)}"
+            cv2.putText(frame, unknown_text, (10, frame.shape[0] - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        return frame
+    
+    def _process_attendance(self, user_id, name, confidence):
+        """Process attendance marking for recognized user"""
+        try:
+            action = self._determine_action()
+            status = self._get_attendance_status(user_id)
+            
+            should_mark = False
+            message = ""
+            
+            if action == 'check_in':
+                if status in ['no_record', 'pending']:
+                    should_mark = True
+                    message = f"✅ Check-in: {name}"
+                else:
+                    message = f"ℹ️ Already checked in: {name}"
+            elif action == 'check_out':
+                if status == 'checked_in':
+                    should_mark = True
+                    message = f"✅ Check-out: {name}"
+                elif status == 'completed':
+                    message = f"ℹ️ Already completed: {name}"
+                else:
+                    message = f"⚠️ No check-in found: {name}"
+            
+            if should_mark:
+                if action == 'check_in':
+                    success = self.db_manager.mark_attendance(user_id, attendance_type='check_in')
+                else:
+                    success = self.db_manager.mark_attendance(user_id, attendance_type='check_out')
+                
+                if success:
+                    st.session_state.last_attendance_message = message
+                    st.session_state.last_attendance_time = datetime.now()
+            else:
+                st.session_state.last_attendance_message = message
+                st.session_state.last_attendance_time = datetime.now()
+                
+        except Exception as e:
+            st.session_state.last_attendance_message = f"❌ Error processing attendance: {str(e)}"
+            st.session_state.last_attendance_time = datetime.now()
 
 class LiveAttendancePageWebRTC:
     def __init__(self):

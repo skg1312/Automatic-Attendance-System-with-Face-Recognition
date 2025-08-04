@@ -47,6 +47,19 @@ class DatabaseManager:
             )
         ''')
         
+        # Create face encodings table for multiple encodings per user
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS face_encodings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                encoding_data BLOB NOT NULL,
+                encoding_index INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT 1,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''')
+        
         # Create attendance table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS attendance (
@@ -111,27 +124,56 @@ class DatabaseManager:
             return bcrypt.checkpw(password.encode('utf-8'), result[0])
         return False
     
-    def add_user(self, name, employee_id, email, department, face_encoding, image_path):
-        """Add new user to database"""
+    def add_user(self, name, employee_id, email, department, face_encodings, image_path, role=None, phone=None):
+        """Add new user to database with multiple face encodings"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
         try:
-            # Serialize face encoding
-            face_encoding_blob = pickle.dumps(face_encoding)
-            
+            # First insert the user
             cursor.execute('''
-                INSERT INTO users (name, employee_id, email, department, face_encoding, image_path)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (name, employee_id, email, department, face_encoding_blob, image_path))
+                INSERT INTO users (name, employee_id, email, department, image_path)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (name, employee_id, email, department, image_path))
             
             user_id = cursor.lastrowid
+            
+            # Insert multiple face encodings
+            if face_encodings:
+                for i, encoding in enumerate(face_encodings):
+                    if encoding is not None:
+                        encoding_blob = pickle.dumps(encoding)
+                        cursor.execute('''
+                            INSERT INTO face_encodings (user_id, encoding_data, encoding_index)
+                            VALUES (?, ?, ?)
+                        ''', (user_id, encoding_blob, i))
+                
+                # Also store the first encoding in the main users table for backward compatibility
+                if len(face_encodings) > 0 and face_encodings[0] is not None:
+                    first_encoding_blob = pickle.dumps(face_encodings[0])
+                    cursor.execute('''
+                        UPDATE users SET face_encoding = ? WHERE id = ?
+                    ''', (first_encoding_blob, user_id))
+            
             conn.commit()
             conn.close()
             return user_id
         except sqlite3.IntegrityError:
             conn.close()
             return None
+    
+    def check_employee_id_exists(self, employee_id):
+        """Check if employee ID already exists"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id FROM users WHERE employee_id = ? AND is_active = 1
+        ''', (employee_id,))
+        
+        result = cursor.fetchone()
+        conn.close()
+        return result is not None
     
     def get_all_users(self):
         """Get all active users"""
@@ -150,29 +192,62 @@ class DatabaseManager:
         return users
     
     def get_user_face_encodings(self):
-        """Get all user face encodings for recognition"""
+        """Get all user face encodings for recognition with multiple encodings support"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
+        # Get users with their multiple encodings
         cursor.execute('''
-            SELECT id, name, employee_id, face_encoding
-            FROM users 
-            WHERE is_active = 1 AND face_encoding IS NOT NULL
+            SELECT u.id, u.name, u.employee_id, u.face_encoding,
+                   fe.encoding_data
+            FROM users u
+            LEFT JOIN face_encodings fe ON u.id = fe.user_id AND fe.is_active = 1
+            WHERE u.is_active = 1
+            ORDER BY u.id, fe.encoding_index
         ''')
         
         results = cursor.fetchall()
         conn.close()
         
-        encodings = []
-        for user_id, name, employee_id, face_encoding_blob in results:
-            if face_encoding_blob:
-                face_encoding = pickle.loads(face_encoding_blob)
-                encodings.append({
+        # Group encodings by user
+        users_dict = {}
+        for user_id, name, employee_id, main_encoding, additional_encoding in results:
+            if user_id not in users_dict:
+                users_dict[user_id] = {
                     'id': user_id,
                     'name': name,
                     'employee_id': employee_id,
-                    'encoding': face_encoding
-                })
+                    'encodings': []
+                }
+            
+            # Add main encoding if exists
+            if main_encoding and not users_dict[user_id]['encodings']:
+                try:
+                    main_enc = pickle.loads(main_encoding)
+                    users_dict[user_id]['encodings'].append(main_enc)
+                except:
+                    pass
+            
+            # Add additional encoding
+            if additional_encoding:
+                try:
+                    add_enc = pickle.loads(additional_encoding)
+                    users_dict[user_id]['encodings'].append(add_enc)
+                except:
+                    pass
+        
+        # Convert to list format expected by face detector
+        encodings = []
+        for user_data in users_dict.values():
+            if user_data['encodings']:
+                # Create entry for each encoding (for better matching)
+                for encoding in user_data['encodings']:
+                    encodings.append({
+                        'id': user_data['id'],
+                        'name': user_data['name'],
+                        'employee_id': user_data['employee_id'],
+                        'encoding': encoding
+                    })
         
         return encodings
     

@@ -9,6 +9,7 @@ from auth.admin_auth import AdminAuth
 from pages._register import RegisterPage
 from pages._live_attendance_webrtc import LiveAttendancePageWebRTC
 from pages._reports import ReportsPage
+from pages.multi_image_registration import MultiImageRegistrationPage
 from database.db_manager import DatabaseManager
 from utils.helpers import get_system_info, StreamlitUtils
 
@@ -171,7 +172,10 @@ def show_main_app(auth):
     elif page == "👥 Register Users":
         register_page = RegisterPage()
         register_page.render()
-    elif page == "🎥 Live Attendance":
+    elif page == "� Multi-Image Registration":
+        multi_reg_page = MultiImageRegistrationPage()
+        multi_reg_page.render()
+    elif page == "�🎥 Live Attendance":
         attendance_page = LiveAttendancePageWebRTC()
         attendance_page.render()
     elif page == "📊 Reports & Analytics":
@@ -253,7 +257,7 @@ def show_dashboard():
         # Quick actions
         st.markdown("### ⚡ Quick Actions")
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
             if st.button("👥 Register New User", type="primary"):
@@ -261,11 +265,16 @@ def show_dashboard():
                 st.rerun()
         
         with col2:
-            if st.button("🎥 Start Live Attendance", type="primary"):
-                st.session_state.current_page = "🎥 Live Attendance"
+            if st.button("� Multi-Image Registration", type="primary"):
+                st.session_state.current_page = "🎯 Multi-Image Registration"
                 st.rerun()
         
         with col3:
+            if st.button("�🎥 Start Live Attendance", type="primary"):
+                st.session_state.current_page = "🎥 Live Attendance"
+                st.rerun()
+        
+        with col4:
             if st.button("📊 View Reports", type="primary"):
                 st.session_state.current_page = "📊 Reports & Analytics"
                 st.rerun()
